@@ -27,13 +27,17 @@
 void ** sys_call_table;  // 指向系统调用入口表的地址
 static u32 pid = 0; // 安全文件保险箱应用程序的进程标识符
 static struct sock *nl_sk = NULL; // 用于Netlink通信的套接字
+
 static char *password_r="123456";
 static char *SecurityPath="/home/zsy/demo"; // security file path
 static  struct nlmsghdr *nlh; //Netlink消息头指针
+
 void netlink_init(void);
 void netlink_release(void);
 void nl_data_ready(struct sk_buff *__skb); 
+
 int netlink_sendmsg(const void *buffer, int pid) ;
+
 unsigned int clear_and_return_cr0(void);
 void * get_sys_call(void);
 void * get_sys_call_table(void);
@@ -43,7 +47,19 @@ void commandoper(char * cc);
 char *composecommand(char *contact,char commandnum);
 
 asmlinkage long hacked_open(const char *pathname, int flags, mode_t mode);
-asmlinkage long(* orig_open)(const char *pathname, int flags, mode_t mode); 
+asmlinkage long(* orig_open)(const char *pathname, int flags, mode_t mode);
+
+asmlinkage long	hacked_rename(const char *oldpath, const char *newpath);
+asmlinkage long(* orig_rename)(const char *oldpath, const char *newpath); //用于保存原来的rename系统调用处理函数地址
+
+asmlinkage long	hacked_link(const char *srcName, const char *destNam);
+asmlinkage long(* orig_link)(const char *srcName, const char *destName); //用于保存原来的link系统调用处理函数地址
+
+asmlinkage long	hacked_rmdir(const char *pathname);
+asmlinkage long(* orig_rmdir)(const char *pathname);
+
+asmlinkage long hacked_symlink(const char *oldpath, const char *newpath);
+asmlinkage long(* orig_symlink)(const char *oldpath, const char *newpath);
 
 
 // interupt descriptor
@@ -61,11 +77,23 @@ static int __init AccessControl_init(void)
 {
 	//printk(KERN_DEBUG"\"%s(pid%d)\" open scnum device!\n",current->comm,current->pid);
 	//current->fs->root;
+	printk("AccessControl init");
 	unsigned int orig_cr0 = clear_and_return_cr0(); //清除控制寄存器CR0的写保护检查控制位，并保存CR0寄存器的原始值
     sys_call_table = get_sys_call_table(); //获取系统调用入口地址表的首地址
     printk("<0>""Info: sys_call_table found at %lx\n", (unsigned long)sys_call_table); //输出系统调用入口地址表的首地址
-    orig_open = sys_call_table[__NR_open]; /*保存open系统调用的原始处理函数入口地址，__NR_open为open的系统调用号，该号对应open系统调用处理函数在系统调用入口地址表的位置*/
-    sys_call_table[__NR_open] = hacked_open; //重载open系统调用处理函数的入口地址
+    
+	orig_open = sys_call_table[__NR_open]; /*保存open系统调用的原始处理函数入口地址，__NR_open为open的系统调用号，该号对应open系统调用处理函数在系统调用入口地址表的位置*/
+    orig_link = sys_call_table[__NR_link]; 
+	orig_rename = sys_call_table[__NR_rename]; 
+	orig_rmdir = sys_call_table[__NR_rmdir]; 
+	orig_symlink = sys_call_table[__NR_symlink];
+	
+	sys_call_table[__NR_open] = hacked_open; //重载open系统调用处理函数的入口地址
+	sys_call_table[__NR_link] = hacked_link; //同上
+	sys_call_table[__NR_rename] = hacked_rename; //同上
+	sys_call_table[__NR_rmdir] = hacked_rmdir;
+	sys_call_table[__NR_symlink] = hacked_symlink;
+
     asm volatile("movl %% eax, %% cr0" : : "a"(orig_cr0)); //恢复控制寄存器CR0的值，即恢复写保护检查控制位
     netlink_init();
     return 0;
@@ -155,6 +183,10 @@ static int __exit AccessControl_exit(void)
 {
 	unsigned int orig_cr0 = clear_and_return_cr0(); //清除控制寄存器CR0的写保护检查控制位，并保存CR0寄存器的原始值
     sys_call_table[__NR_open] = orig_open;  //恢复原始open系统调用处理函数
+	sys_call_table[__NR_link] = orig_link;
+	sys_call_table[__NR_rename] = orig_rename;
+	sys_call_table[__NR_rmdir] = orig_rmdir;
+	sys_call_table[__NR_symlink] = orig_symlink;
     asm volatile("movl %% eax, %% cr0" : : "a"(orig_cr0)); //恢复控制寄存器CR0的值，即恢复写保护检查控制位
     netlink_release();
 }
@@ -295,7 +327,7 @@ asmlinkage long hacked_open(const char *pathname, int flags, mode_t mode)
 				int spid=current->pid;
 				int ppid=current->real_parent->pid;
 				char logbuff[256];
-				sprintf(logbuff,"pid:%d ppid:%d comm:%s be rejected!\n",spid,ppid,current->comm);
+				sprintf(logbuff,"pid:%d ppid:%d comm:%s open be rejected!\n",spid,ppid,current->comm);
 				printk("pid:%d ppid:%d comm:%s be rejected!\n",spid,ppid,current->comm);
 				netlink_sendmsg(composecommand(logbuff,LOG_SEAND), pid);
 			} 
@@ -305,6 +337,203 @@ asmlinkage long hacked_open(const char *pathname, int flags, mode_t mode)
     }
 
 }
+
+asmlinkage long hacked_link(const char *srcName, const char *destName)
+{
+	
+	long ret;                          // 记录原open系统调用处理函数的返回值
+	char commandname[TASK_COMM_LEN];   // 程序名缓冲区
+	char fullname[256];                // 所打开文件的全路径名缓冲区
+    memset(fullname, 0, 256);          // 初始化所打开文件的全路径名缓冲区
+
+    get_fullname(srcName, fullname);  // 获得所打开文件的全路径名
+
+    char tmp_path[256];
+    int len = strlen(SecurityPath);
+	while(len<strlen(fullname)&&fullname[len]!='/')
+	{
+		len++;
+	}
+    memcpy(tmp_path,fullname, len);
+	tmp_path[len]='\0';
+
+    if(strcmp(tmp_path, SecurityPath) != 0) {
+    	ret = orig_link(srcName, destName); 
+		//printk("You can link it");
+    	return ret;
+    }
+    else {
+	    if(current->real_parent->pid == pid) {
+			if(pid!=0)
+			{
+				int spid=current->pid;
+				int ppid=current->real_parent->pid;
+				char logbuff[256];
+				sprintf(logbuff,"pid:%d ppid:%d comm:%s access this file!\n",spid,ppid,current->comm);
+				//printk("pid:%d ppid:%d have access this file!  %s \n ",spid,ppid,current->comm);
+				netlink_sendmsg(composecommand(logbuff,LOG_SEAND), pid);
+			} 
+        		ret = orig_link(srcName, destName); 
+    	    	return ret;
+        }
+        else{
+			if(pid!=0)
+			{
+				int spid=current->pid;
+				int ppid=current->real_parent->pid;
+				char logbuff[256];
+				sprintf(logbuff,"pid:%d ppid:%d comm:%s be rejected!\n",spid,ppid,current->comm);
+				//printk("pid:%d ppid:%d comm:%s be rejected!\n",spid,ppid,current->comm);
+				netlink_sendmsg(composecommand(logbuff,LOG_SEAND), pid);
+			} 
+        	//printk("You have no access to link it");
+        }
+	
+    }
+}
+
+
+asmlinkage long	hacked_rename(const char *oldpath, const char *newpath)
+{
+	long ret;                          // 记录原open系统调用处理函数的返回值
+	char fullname[256];                // 所打开文件的全路径名缓冲区
+    memset(fullname, 0, 256);          // 初始化所打开文件的全路径名缓冲区
+    get_fullname(oldpath, fullname);  // 获得所打开文件的全路径名
+
+    char tmp_path[256];
+    int len = strlen(SecurityPath);
+	while(len<strlen(fullname)&&fullname[len]!='/')
+	{
+		len++;
+	}
+    memcpy(tmp_path,fullname, len);
+	tmp_path[len]='\0';
+
+    if(strcmp(tmp_path, SecurityPath) != 0) {
+    	ret = orig_rename(oldpath, newpath); 
+    	return ret;
+    }
+    else {
+	    if(current->real_parent->pid == pid) {
+			if(pid!=0)
+			{
+				int spid=current->pid;
+				int ppid=current->real_parent->pid;
+				char logbuff[256];
+				sprintf(logbuff,"pid:%d ppid:%d comm:%s rename this file!\n",spid,ppid,current->comm);
+				netlink_sendmsg(composecommand(logbuff,LOG_SEAND), pid);
+			} 
+        		ret = orig_rename(oldpath, newpath);  
+    	    	return ret;
+        }
+        else{
+			if(pid!=0)
+			{
+				int spid=current->pid;
+				int ppid=current->real_parent->pid;
+				char logbuff[256];
+				sprintf(logbuff,"pid:%d ppid:%d comm:%s rename be rejected!\n",spid,ppid,current->comm);
+				netlink_sendmsg(composecommand(logbuff,LOG_SEAND), pid);
+			} 
+        }
+	
+    }
+}
+asmlinkage long	hacked_rmdir(const char *pathname)
+{
+	long ret;                          // 记录原open系统调用处理函数的返回值
+	char fullname[256];                // 所打开文件的全路径名缓冲区
+    memset(fullname, 0, 256);          // 初始化所打开文件的全路径名缓冲区
+    get_fullname(pathname, fullname);  // 获得所打开文件的全路径名
+
+    char tmp_path[256];
+    int len = strlen(SecurityPath);
+	while(len<strlen(fullname)&&fullname[len]!='/')
+	{
+		len++;
+	}
+    memcpy(tmp_path,fullname, len);
+	tmp_path[len]='\0';
+
+    if(strcmp(tmp_path, SecurityPath) != 0) {
+    	ret = orig_rmdir(pathname); 
+    	return ret;
+    }
+    else {
+	    if(current->real_parent->pid == pid) {
+			if(pid!=0)
+			{
+				int spid=current->pid;
+				int ppid=current->real_parent->pid;
+				char logbuff[256];
+				sprintf(logbuff,"pid:%d ppid:%d comm:%s delete this file!\n",spid,ppid,current->comm);
+				netlink_sendmsg(composecommand(logbuff,LOG_SEAND), pid);
+			} 
+        		ret = orig_rmdir(pathname);   
+    	    	return ret;
+        }
+        else{
+			if(pid!=0)
+			{
+				int spid=current->pid;
+				int ppid=current->real_parent->pid;
+				char logbuff[256];
+				sprintf(logbuff,"pid:%d ppid:%d comm:%s delete be rejected!\n",spid,ppid,current->comm);
+				netlink_sendmsg(composecommand(logbuff,LOG_SEAND), pid);
+			} 
+        }
+	
+    }
+}
+
+asmlinkage long hacked_symlink(const char *oldpath, const char *newpath)
+{
+	
+	long ret;                          // 记录原open系统调用处理函数的返回值
+	char fullname[256];                // 所打开文件的全路径名缓冲区
+    memset(fullname, 0, 256);          // 初始化所打开文件的全路径名缓冲区
+    get_fullname(oldpath, fullname);  // 获得所打开文件的全路径名
+
+    char tmp_path[256];
+    int len = strlen(SecurityPath);
+	while(len<strlen(fullname)&&fullname[len]!='/')
+	{
+		len++;
+	}
+    memcpy(tmp_path,fullname, len);
+	tmp_path[len]='\0';
+
+    if(strcmp(tmp_path, SecurityPath) != 0) {
+    	ret = orig_symlink(oldpath, newpath); 
+    	return ret;
+    }
+    else {
+	    if(current->real_parent->pid == pid) {
+			if(pid!=0)
+			{
+				int spid=current->pid;
+				int ppid=current->real_parent->pid;
+				char logbuff[256];
+				sprintf(logbuff,"pid:%d ppid:%d comm:%s link this file!\n",spid,ppid,current->comm);
+				netlink_sendmsg(composecommand(logbuff,LOG_SEAND), pid);
+			} 
+        		ret = orig_symlink(oldpath, newpath);  
+    	    	return ret;
+        }
+        else{
+			if(pid!=0)
+			{
+				int spid=current->pid;
+				int ppid=current->real_parent->pid;
+				char logbuff[256];
+				sprintf(logbuff,"pid:%d ppid:%d comm:%s link be rejected!\n",spid,ppid,current->comm);
+				netlink_sendmsg(composecommand(logbuff,LOG_SEAND), pid);
+			} 
+        }
+	
+    }
+}
+
 char *composecommand(char *contact,char commandnum)
 {
 	int c_len=strlen(contact);
